@@ -1,15 +1,15 @@
 /******************************************************************************
-* echo_server.c                                                               *
-*                                                                             *
-* Description: This file contains the C source code for an echo server.  The  *
-*              server runs on a hard-coded port and simply write back anything*
-*              sent to it by connected clients.  It does not support          *
-*              concurrent clients.                                            *
-*                                                                             *
-* Authors: Athula Balachandran <abalacha@cs.cmu.edu>,                         *
-*          Wolf Richter <wolf@cs.cmu.edu>                                     *
-*                                                                             *
-*******************************************************************************/
+ * echo_server.c                                                               *
+ *                                                                             *
+ * Description: This file contains the C source code for an echo server.  The  *
+ *              server runs on a hard-coded port and simply write back anything*
+ *              sent to it by connected clients.  It does not support          *
+ *              concurrent clients.                                            *
+ *                                                                             *
+ * Authors: Athula Balachandran <abalacha@cs.cmu.edu>,                         *
+ *          Wolf Richter <wolf@cs.cmu.edu>                                     *
+ *                                                                             *
+ *******************************************************************************/
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include "parse.h"
 
 #define ECHO_PORT 9999
 #define BUF_SIZE 4096
@@ -32,7 +33,7 @@ int close_socket(int sock)
     return 0;
 }
 
-int main(int argc, char* argv[])
+int main(int argc, char *argv[])
 {
     int sock, client_sock;
     ssize_t readret;
@@ -41,7 +42,7 @@ int main(int argc, char* argv[])
     char buf[BUF_SIZE];
 
     fprintf(stdout, "----- Echo Server -----\n");
-    
+
     /* all networked programs must create a socket */
     if ((sock = socket(PF_INET, SOCK_STREAM, 0)) == -1)
     {
@@ -54,13 +55,12 @@ int main(int argc, char* argv[])
     addr.sin_addr.s_addr = INADDR_ANY;
 
     /* servers bind sockets to ports---notify the OS they accept connections */
-    if (bind(sock, (struct sockaddr *) &addr, sizeof(addr)))
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)))
     {
         close_socket(sock);
         fprintf(stderr, "Failed binding socket.\n");
         return EXIT_FAILURE;
     }
-
 
     if (listen(sock, 5))
     {
@@ -73,8 +73,8 @@ int main(int argc, char* argv[])
     while (1)
     {
         cli_size = sizeof(cli_addr);
-        if ((client_sock = accept(sock, (struct sockaddr *) &cli_addr,
-                                    &cli_size)) == -1)
+        if ((client_sock = accept(sock, (struct sockaddr *)&cli_addr,
+                                  &cli_size)) == -1)
         {
             close(sock);
             fprintf(stderr, "Error accepting connection.\n");
@@ -83,8 +83,39 @@ int main(int argc, char* argv[])
 
         readret = 0;
 
-        while((readret = recv(client_sock, buf, BUF_SIZE, 0)) >= 1)
+        while ((readret = recv(client_sock, buf, BUF_SIZE, 0)) >= 1)
         {
+            buf[readret] = '\0'; // 确保字符串以 null 结尾
+
+            // 调用 parse() 函数解析请求
+            Request *request = parse(buf, readret);
+            if (request == NULL)
+            {
+                // 格式错误，返回 400 Bad Request
+                char *http_response = "HTTP/1.1 400 Bad Request\r\n\r\n";
+                send(client_sock, http_response, strlen(http_response), 0);
+            }
+            else
+            {
+                // 根据请求方法返回响应
+                if (strcmp(request->http_method, "GET") == 0 || strcmp(request->http_method, "HEAD") == 0 || strcmp(request->http_method, "POST") == 0)
+                {
+                    // Echo 请求内容
+                    char *http_response = "HTTP/1.1 200 OK\r\n\r\n";
+                    send(client_sock, http_response, strlen(http_response), 0);
+                }
+                else
+                {
+                    // 返回 501 Not Implemented 错误
+                    char *http_response = "HTTP/1.1 501 Not Implemented\r\n\r\n";
+                    send(client_sock, http_response, strlen(http_response), 0);
+                }
+
+                // 释放内存
+                free(request->headers);
+                free(request);
+            }
+
             if (send(client_sock, buf, readret, 0) != readret)
             {
                 close_socket(client_sock);
@@ -93,7 +124,7 @@ int main(int argc, char* argv[])
                 return EXIT_FAILURE;
             }
             memset(buf, 0, BUF_SIZE);
-        } 
+        }
 
         if (readret == -1)
         {

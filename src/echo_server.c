@@ -15,6 +15,7 @@
 #include <netinet/ip.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <fcntl.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -85,7 +86,15 @@ int main(int argc, char *argv[])
 
         while ((readret = recv(client_sock, buf, BUF_SIZE, 0)) >= 1)
         {
-            buf[readret] = '\0'; // 确保字符串以 null 结尾
+            // ! JUST FOR TEST 
+            // int fd_in = open("./samples/test", O_RDONLY);
+            // if (fd_in < 0)
+            // {
+            //     printf("Failed to open the file\n");
+            //     return 0;
+            // }
+            // readret = read(fd_in, buf, BUF_SIZE);
+            // close(fd_in);
 
             // 调用 parse() 函数解析请求
             Request *request = parse(buf, readret);
@@ -116,7 +125,8 @@ int main(int argc, char *argv[])
                 free(request);
             }
 
-            if (send(client_sock, buf, readret, 0) != readret)
+            ssize_t sent = send(client_sock, buf, readret, 0);
+            if (sent != readret)
             {
                 close_socket(client_sock);
                 close_socket(sock);

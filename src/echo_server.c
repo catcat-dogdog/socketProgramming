@@ -86,7 +86,7 @@ int main(int argc, char *argv[])
 
         while ((readret = recv(client_sock, buf, BUF_SIZE, 0)) >= 1)
         {
-            // ! JUST FOR TEST 
+            // ! JUST FOR TEST
             // int fd_in = open("./samples/test", O_RDONLY);
             // if (fd_in < 0)
             // {
@@ -112,6 +112,15 @@ int main(int argc, char *argv[])
                     // Echo 请求内容
                     char *http_response = "HTTP/1.1 200 OK\r\n\r\n";
                     send(client_sock, http_response, strlen(http_response), 0);
+
+                    ssize_t sent = send(client_sock, buf, readret, 0);
+                    if (sent != readret)
+                    {
+                        close_socket(client_sock);
+                        close_socket(sock);
+                        fprintf(stderr, "Error sending to client.\n");
+                        return EXIT_FAILURE;
+                    }
                 }
                 else
                 {
@@ -125,14 +134,6 @@ int main(int argc, char *argv[])
                 free(request);
             }
 
-            ssize_t sent = send(client_sock, buf, readret, 0);
-            if (sent != readret)
-            {
-                close_socket(client_sock);
-                close_socket(sock);
-                fprintf(stderr, "Error sending to client.\n");
-                return EXIT_FAILURE;
-            }
             memset(buf, 0, BUF_SIZE);
         }
 

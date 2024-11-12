@@ -53,7 +53,6 @@ Request * parse(char *buffer, int size) {
     }
 
     // Valid End State
-    printf("%d\n",state);
     if (state == STATE_CRLFCRLF) {
         Request *request = (Request *) malloc(sizeof(Request));
         request->header_count = 0;

@@ -19,7 +19,7 @@
 #define LEXDEBUG
 #ifdef LEXDEBUG
 #include <stdio.h>
-#define LPRINTF(...) printf(__VA_ARGS__)
+#define LPRINTF(...) //printf(__VA_ARGS__)
 #else
 #define LPRINTF(...)
 #endif

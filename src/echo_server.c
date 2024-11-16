@@ -19,7 +19,10 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <errno.h>
+#include <arpa/inet.h>
 #include "parse.h"
+#include "logger.h"
 
 #define ECHO_PORT 9999
 #define BUF_SIZE 4096
@@ -44,10 +47,28 @@ int main(int argc, char *argv[])
 
     fprintf(stdout, "----- Echo Server -----\n");
 
+    // 初始化日志
+    if (log_init("server.log") != 0)
+    {
+        fprintf(stderr, "Failed to initialize logger.\n");
+        return EXIT_FAILURE;
+    }
+
+    LOG_INFO("Echo Server starting...");
+
     /* all networked programs must create a socket */
     if ((sock = socket(PF_INET, SOCK_STREAM, 0)) == -1)
     {
-        fprintf(stderr, "Failed creating socket.\n");
+        LOG_ERROR("Failed creating socket");
+        return EXIT_FAILURE;
+    }
+
+    // 添加 socket 重用选项
+    int optval = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1)
+    {
+        LOG_ERROR("Failed to set socket options");
+        close_socket(sock);
         return EXIT_FAILURE;
     }
 
@@ -58,8 +79,8 @@ int main(int argc, char *argv[])
     /* servers bind sockets to ports---notify the OS they accept connections */
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)))
     {
-        close_socket(sock);
-        fprintf(stderr, "Failed binding socket.\n");
+        LOG_ERROR("Failed binding socket: %s", strerror(errno));
+        close_socket(sock); // 确保在错误时关闭 socket
         return EXIT_FAILURE;
     }
 
@@ -77,12 +98,17 @@ int main(int argc, char *argv[])
         if ((client_sock = accept(sock, (struct sockaddr *)&cli_addr,
                                   &cli_size)) == -1)
         {
+            LOG_ERROR("Error accepting connection");
             close(sock);
-            fprintf(stderr, "Error accepting connection.\n");
             return EXIT_FAILURE;
         }
 
+        LOG_INFO("New client connected from %s:%d",
+                 inet_ntoa(cli_addr.sin_addr),
+                 ntohs(cli_addr.sin_port));
+
         readret = 0;
+        memset(buf, 0, BUF_SIZE); // 清空缓冲区
 
         while ((readret = recv(client_sock, buf, BUF_SIZE, 0)) >= 1)
         {
@@ -100,37 +126,43 @@ int main(int argc, char *argv[])
             Request *request = parse(buf, readret);
             if (request == NULL)
             {
-                // 格式错误，返回 400 Bad Request
+                LOG_ERROR("Failed to parse request");
                 char *http_response = "HTTP/1.1 400 Bad Request\r\n\r\n";
                 send(client_sock, http_response, strlen(http_response), 0);
             }
             else
             {
-                // 根据请求方法返回响应
-                if (strcmp(request->http_method, "GET") == 0 || strcmp(request->http_method, "HEAD") == 0 || strcmp(request->http_method, "POST") == 0)
+                // 检查 request 的各个字段是否为 NULL
+                if (request->http_method != NULL && request->http_uri != NULL && request->http_version != NULL)
                 {
-                    // Echo 请求内容
-                    char *http_response = "HTTP/1.1 200 OK\r\n\r\n";
-                    send(client_sock, http_response, strlen(http_response), 0);
+                    LOG_INFO("Received %s request for %s", request->http_method, request->http_uri);
 
-                    ssize_t sent = send(client_sock, buf, readret, 0);
-                    if (sent != readret)
+                    if (strcmp(request->http_method, "GET") == 0 ||
+                        strcmp(request->http_method, "HEAD") == 0 ||
+                        strcmp(request->http_method, "POST") == 0)
                     {
-                        close_socket(client_sock);
-                        close_socket(sock);
-                        fprintf(stderr, "Error sending to client.\n");
-                        return EXIT_FAILURE;
+                        char *http_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
+                        send(client_sock, http_response, strlen(http_response), 0);
+                        send(client_sock, buf, readret, 0);
+                    }
+                    else
+                    {
+                        char *http_response = "HTTP/1.1 501 Not Implemented\r\n\r\n";
+                        send(client_sock, http_response, strlen(http_response), 0);
                     }
                 }
                 else
                 {
-                    // 返回 501 Not Implemented 错误
-                    char *http_response = "HTTP/1.1 501 Not Implemented\r\n\r\n";
+                    LOG_ERROR("Invalid request structure");
+                    char *http_response = "HTTP/1.1 400 Bad Request\r\n\r\n";
                     send(client_sock, http_response, strlen(http_response), 0);
                 }
 
-                // 释放内存
-                free(request->headers);
+                // 释放请求结构体
+                if (request->headers != NULL)
+                {
+                    free(request->headers);
+                }
                 free(request);
             }
 
@@ -139,6 +171,7 @@ int main(int argc, char *argv[])
 
         if (readret == -1)
         {
+            LOG_ERROR("Error reading from client socket: %s", strerror(errno));
             close_socket(client_sock);
             close_socket(sock);
             fprintf(stderr, "Error reading from client socket.\n");
@@ -148,6 +181,7 @@ int main(int argc, char *argv[])
         if (close_socket(client_sock))
         {
             close_socket(sock);
+            LOG_INFO("Client disconnected");
             fprintf(stderr, "Error closing client socket.\n");
             return EXIT_FAILURE;
         }
@@ -155,5 +189,6 @@ int main(int argc, char *argv[])
 
     close_socket(sock);
 
+    log_close();
     return EXIT_SUCCESS;
 }

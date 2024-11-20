@@ -35,7 +35,7 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c $(OBJ_DIR)
 liso_server: $(OBJ_DIR)/y.tab.o $(OBJ_DIR)/lex.yy.o $(OBJ_DIR)/parse.o $(OBJ_DIR)/echo_server.o $(OBJ_DIR)/logger.o
 	$(CC) -Werror $^ -o $@ $(LDFLAGS)
 
-echo_client: $(OBJ_DIR)/echo_client.o
+echo_client: $(OBJ_DIR)/echo_client.o $(OBJ_DIR)/logger.o
 	$(CC) -Werror $^ -o $@ $(LDFLAGS)
 
 $(OBJ_DIR):

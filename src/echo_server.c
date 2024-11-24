@@ -453,7 +453,7 @@ void handle_client(int client_sock, struct sockaddr_in client_addr)
                 
                 if (!request) {
                     LOG_ERROR("Parse failed for data: %.100s", node->data);
-                    send(client_sock, RESPONSE_500, strlen(RESPONSE_500), 0);
+                    send(client_sock, RESPONSE_400, strlen(RESPONSE_400), 0);
                     free(node->data);
                     free(node);
                     continue;
@@ -471,10 +471,6 @@ void handle_client(int client_sock, struct sockaddr_in client_addr)
                 }
                 else
                 {
-                    LOG_WARN("Unsupported method %s from %s:%d",
-                             request->http_method,
-                             client_ip,
-                             ntohs(client_addr.sin_port));
                     handle_unsupported_method(client_sock);
                 }
                 free(request);
@@ -520,6 +516,8 @@ void handle_client(int client_sock, struct sockaddr_in client_addr)
 
 void handle_get_head_request(int client_sock, Request *request)
 {
+    LOG_INFO("Processing %s request for URI: %s", request->http_method, request->http_uri);
+    
     char file_path[BUF_SIZE] = "static_site";
 
     // 处理根路径请求
@@ -537,6 +535,7 @@ void handle_get_head_request(int client_sock, Request *request)
     {
         LOG_ERROR("Cannot open file: %s", file_path);
         send(client_sock, RESPONSE_404, strlen(RESPONSE_404), 0);
+        LOG_INFO("Sent 404 response");
         return;
     }
 
@@ -563,24 +562,32 @@ void handle_get_head_request(int client_sock, Request *request)
              content_type,
              path_stat.st_size);
     // 如果是 HEAD 请求，只发送响应头
-    if (strcmp(request->http_method, "HEAD") == 0   )
+    if (strcmp(request->http_method, "HEAD") == 0)
     {
         send(client_sock, response_header, strlen(response_header), 0);
+        LOG_INFO("Sent HEAD response headers for: %s", file_path);
         return;
     }
 
     // 如果是 GET 请求，发送文件内容
     if (strcmp(request->http_method, "GET") == 0)
     {
+        LOG_INFO("Starting to send file content for: %s", file_path);
         char file_buf[BUF_SIZE];
         size_t file_read;
+        size_t total_sent = 0;
+        
         file_read = fread(file_buf, 1, BUF_SIZE - strlen(response_header) - 1, file);
         strcat(response_header, file_buf);   
         send(client_sock, response_header, strlen(response_header), 0);
+        total_sent += file_read;
+        
         while ((file_read = fread(file_buf, 1, BUF_SIZE, file)) > 0)
         {
             send(client_sock, file_buf, file_read, 0);
+            total_sent += file_read;
         }
+        LOG_INFO("Completed sending file: %s, total bytes sent: %zu", file_path, total_sent);
     }
 
     fclose(file);
@@ -588,11 +595,12 @@ void handle_get_head_request(int client_sock, Request *request)
 
 void handle_post_request(int client_sock, char *buf, ssize_t readret)
 {
-    // 查找 Content-Length 头部
+    LOG_INFO("Processing POST request");
+
     char *content_length_str = strstr(buf, "Content-Length: ");
     if (!content_length_str)
     {
-        LOG_ERROR("No Content-Length found in POST request");
+        LOG_ERROR("POST request missing Content-Length header");
         send(client_sock, RESPONSE_400, strlen(RESPONSE_400), 0);
         send(client_sock, buf, readret, 0);
         return;
@@ -600,9 +608,11 @@ void handle_post_request(int client_sock, char *buf, ssize_t readret)
 
     // 解析 Content-Length
     long content_length = strtol(content_length_str + 16, NULL, 10);
+    LOG_INFO("POST request Content-Length: %ld bytes", content_length);
+
     if (content_length <= 0 || content_length > MAX_CONTENT_LENGTH)
     {
-        LOG_ERROR("Invalid Content-Length: %ld", content_length);
+        LOG_ERROR("Invalid Content-Length: %ld (max allowed: %d)", content_length, MAX_CONTENT_LENGTH);
         send(client_sock, RESPONSE_400, strlen(RESPONSE_400), 0);
         send(client_sock, buf, readret, 0);
         return;
@@ -668,12 +678,15 @@ void handle_post_request(int client_sock, char *buf, ssize_t readret)
     send(client_sock, response, strlen(response), 0);
     send(client_sock, buf, readret, 0);
 
+    LOG_INFO("Successfully received all POST data");
     free(post_data);
 }
 
 void handle_unsupported_method(int client_sock)
 {
+    LOG_WARN("Received request with unsupported HTTP method");
     send(client_sock, RESPONSE_501, strlen(RESPONSE_501), 0);
+    LOG_INFO("Sent 501 Not Implemented response");
 }
 
 ThreadPool *thread_pool_create(int thread_count)
@@ -707,19 +720,22 @@ ThreadPool *thread_pool_create(int thread_count)
 void *worker_thread(void *arg)
 {
     ThreadPool *pool = (ThreadPool *)arg;
+    pthread_t tid = pthread_self();
+    // LOG_INFO("Worker thread %lu started", (unsigned long)tid);
 
     while (1)
     {
         pthread_mutex_lock(&pool->queue_mutex);
 
-        // 等待任务
         while (pool->task_size == 0 && !pool->shutdown)
         {
+            // LOG_DEBUG("Thread %lu waiting for task", (unsigned long)tid);
             pthread_cond_wait(&pool->queue_not_empty, &pool->queue_mutex);
         }
 
         if (pool->shutdown)
         {
+            // LOG_INFO("Thread %lu shutting down", (unsigned long)tid);
             pthread_mutex_unlock(&pool->queue_mutex);
             pthread_exit(NULL);
         }
@@ -729,6 +745,8 @@ void *worker_thread(void *arg)
         struct sockaddr_in client_addr = pool->tasks[pool->task_front].client_addr;
         pool->task_front = (pool->task_front + 1) % pool->task_capacity;
         pool->task_size--;
+
+        // LOG_INFO("Thread %lu processing new client connection", (unsigned long)tid);
 
         pthread_mutex_unlock(&pool->queue_mutex);
         pthread_cond_signal(&pool->queue_not_full);

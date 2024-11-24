@@ -4,6 +4,7 @@ static_site/uploads/
 *.log
 *.html
 *.cmd
+*.py
 week3/
 week4/
 cheat/

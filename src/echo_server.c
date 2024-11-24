@@ -97,26 +97,82 @@ int close_socket(int sock)
     return 0;
 }
 
+// 修改 RequestQueue 结构体
 struct RequestQueue
 {
-    char *requests[MAX_REQUESTS_IN_PIPELINE];
-    size_t sizes[MAX_REQUESTS_IN_PIPELINE];
-    int front;
-    int rear;
+    struct RequestNode
+    {
+        char *data;
+        size_t size;
+        struct RequestNode *next;
+    } *head, *tail;
     int count;
+    pthread_mutex_t mutex;
 };
 
-// 添加队列操作函数
+// 初始化请求队列
 void initQueue(struct RequestQueue *queue)
 {
-    queue->front = 0;
-    queue->rear = -1;
+    queue->head = queue->tail = NULL;
     queue->count = 0;
-    for (int i = 0; i < MAX_REQUESTS_IN_PIPELINE; i++)
+    pthread_mutex_init(&queue->mutex, NULL);
+}
+
+// 添加请求到队列
+bool enqueueRequest(struct RequestQueue *queue, const char *data, size_t size)
+{
+    struct RequestNode *node = malloc(sizeof(struct RequestNode));
+    if (!node)
+        return false;
+
+    node->data = malloc(size + 1);
+    if (!node->data)
     {
-        queue->requests[i] = NULL;
-        queue->sizes[i] = 0;
+        free(node);
+        return false;
     }
+
+    memcpy(node->data, data, size);
+    node->data[size] = '\0';
+    node->size = size;
+    node->next = NULL;
+
+    pthread_mutex_lock(&queue->mutex);
+    if (queue->tail)
+    {
+        queue->tail->next = node;
+    }
+    else
+    {
+        queue->head = node;
+    }
+    queue->tail = node;
+    queue->count++;
+    pthread_mutex_unlock(&queue->mutex);
+
+    return true;
+}
+
+// 从队列中获取请求
+struct RequestNode *dequeueRequest(struct RequestQueue *queue)
+{
+    pthread_mutex_lock(&queue->mutex);
+    if (!queue->head)
+    {
+        pthread_mutex_unlock(&queue->mutex);
+        return NULL;
+    }
+
+    struct RequestNode *node = queue->head;
+    queue->head = node->next;
+    if (!queue->head)
+    {
+        queue->tail = NULL;
+    }
+    queue->count--;
+    pthread_mutex_unlock(&queue->mutex);
+
+    return node;
 }
 
 // 线程池结构
@@ -151,9 +207,8 @@ void *worker_thread(void *arg);
 
 int main(int argc, char *argv[])
 {
-    int sock, client_sock;
-    socklen_t cli_size;
-    struct sockaddr_in addr, cli_addr;
+    int sock;
+    struct sockaddr_in addr;
 
     fprintf(stdout, "----- Echo Server -----\n");
 
@@ -259,8 +314,20 @@ int main(int argc, char *argv[])
 
                 if (client_sock == -1)
                 {
-                    LOG_ERROR("Accept failed");
-                    continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    {
+                        // 非阻塞模式下没有连接可接受
+                        continue;
+                    }
+                    LOG_ERROR("Accept failed: %s", strerror(errno));
+                    continue;  // 继续循环而不是退出
+                }
+
+                // 设置客户端socket为非阻塞模式
+                int flags = fcntl(client_sock, F_GETFL, 0);
+                if (flags != -1)
+                {
+                    fcntl(client_sock, F_SETFL, flags | O_NONBLOCK);
                 }
 
                 // 将新客户端添加到线程池
@@ -273,128 +340,182 @@ int main(int argc, char *argv[])
     thread_pool_destroy(thread_pool);
     close(epoll_fd);
     close_socket(sock);
-
     log_close();
     return EXIT_SUCCESS;
 }
 
+// 添加语法解析锁
+static pthread_mutex_t parser_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// 处理客户端请求
 void handle_client(int client_sock, struct sockaddr_in client_addr)
 {
-    LOG_INFO("New client connected from %s:%d",
-             inet_ntoa(client_addr.sin_addr),
-             ntohs(client_addr.sin_port));
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+    LOG_INFO("New client connection from %s:%d", client_ip, ntohs(client_addr.sin_port));
 
-    char pipeline_buf[BUF_SIZE * MAX_REQUESTS_IN_PIPELINE];
-    size_t total_received = 0;
-    ssize_t readret;
-    bool keep_alive = true; // 默认保持连接
+    char buf[BUF_SIZE];
+    struct RequestQueue queue;
+    initQueue(&queue);
+    size_t partial_len = 0;
+    char *partial_buf = NULL;
 
-    while (keep_alive &&
-           (readret = recv(client_sock, pipeline_buf + total_received,
-                           BUF_SIZE * MAX_REQUESTS_IN_PIPELINE - total_received, 0)) > 0)
-    {
+    // 设置超时时间
+    struct timeval tv;
+    tv.tv_sec = 5;  // 5秒超时
+    tv.tv_usec = 0;
+    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 
-        total_received += readret;
-        pipeline_buf[total_received] = '\0';
-
-        LOG_INFO("Received %zd bytes from client, total buffer size: %zu",
-                 readret, total_received);
-
-        // 处理可能的多个请求
-        char *request_start = pipeline_buf;
-        char *next_request;
-        int request_count = 0;
-
-        while ((next_request = strstr(request_start, "\r\n\r\n")) != NULL)
+    while (1) {
+        ssize_t readret = recv(client_sock, buf, BUF_SIZE - 1, 0);
+        if (readret < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 使用select来等待数据
+                fd_set readfds;
+                FD_ZERO(&readfds);
+                FD_SET(client_sock, &readfds);
+                
+                struct timeval timeout;
+                timeout.tv_sec = 1;  // 1秒超时
+                timeout.tv_usec = 0;
+                
+                int select_result = select(client_sock + 1, &readfds, NULL, NULL, &timeout);
+                if (select_result > 0) {
+                    continue;  // 有数据可读，继续循环
+                } else if (select_result == 0) {
+                    // 超时，但继续等待
+                    continue;
+                } else {
+                    // select错误
+                    LOG_ERROR("Select error for client %s:%d: %s",
+                             client_ip, ntohs(client_addr.sin_port), strerror(errno));
+                    break;
+                }
+            }
+            
+            LOG_ERROR("Failed to read from client %s:%d: %s",
+                      client_ip, ntohs(client_addr.sin_port), strerror(errno));
+            break;
+        }
+        if (readret == 0)
         {
-            size_t request_size = next_request - request_start + 4;
-            request_count++;
+            LOG_INFO("Client %s:%d disconnected", client_ip, ntohs(client_addr.sin_port));
+            break;
+        }
 
-            LOG_INFO("Processing request %d in pipeline (size: %zu bytes)",
-                     request_count, request_size);
+        buf[readret] = '\0';
+        LOG_DEBUG("Received %zd bytes from %s:%d", readret, client_ip, ntohs(client_addr.sin_port));
+        char *current = buf;
 
-            // 解析请求
-            Request *request = parse(request_start, request_size);
-            if (request != NULL)
+        // 处理之前的不完整请求
+        if (partial_buf)
+        {
+            char *new_buf = realloc(partial_buf, partial_len + readret + 1);
+            if (!new_buf)
             {
-                LOG_INFO("Request %d - Method: %s, URI: %s, Version: %s",
-                         request_count,
-                         request->http_method,
-                         request->http_uri,
-                         request->http_version);
+                free(partial_buf);
+                break;
+            }
+            partial_buf = new_buf;
+            memcpy(partial_buf + partial_len, buf, readret);
+            partial_len += readret;
+            partial_buf[partial_len] = '\0';
+            current = partial_buf;
+        }
 
-                if (strcmp(request->http_version, "HTTP/1.1") != 0)
-                {
-                    LOG_ERROR("Unsupported HTTP version: %s", request->http_version);
-                    send(client_sock, RESPONSE_505, strlen(RESPONSE_505), 0);
-                }
-                else if (request->http_method != NULL && request->http_uri != NULL)
-                {
-                    if (strcmp(request->http_method, "GET") == 0 ||
-                        strcmp(request->http_method, "HEAD") == 0)
-                    {
-                        handle_get_head_request(client_sock, request);
-                    }
-                    else if (strcmp(request->http_method, "POST") == 0)
-                    {
-                        handle_post_request(client_sock, request_start, request_size);
-                    }
-                    else
-                    {
-                        LOG_ERROR("Unsupported method: %s", request->http_method);
-                        handle_unsupported_method(client_sock);
-                    }
-                }
+        // 解析请求
+        char *request_end;
+        while ((request_end = strstr(current, "\r\n\r\n")))
+        {
+            size_t request_len = request_end - current + 4;
 
-                // 释放请求结构体
-                if (request->headers != NULL)
+            // 将完整请求加入队列
+            if (!enqueueRequest(&queue, current, request_len))
+            {
+                LOG_ERROR("Failed to enqueue request from %s:%d: out of memory",
+                          client_ip, ntohs(client_addr.sin_port));
+                break;
+            }
+
+            LOG_DEBUG("Enqueued request from %s:%d, queue size: %d",
+                      client_ip, ntohs(client_addr.sin_port), queue.count);
+
+            current = request_end + 4;
+
+            // 处理队列中的请求
+            struct RequestNode *node;
+            while ((node = dequeueRequest(&queue)))
+            {
+                // 在解析前加锁
+                pthread_mutex_lock(&parser_mutex);
+                Request *request = parse(node->data, node->size);
+                pthread_mutex_unlock(&parser_mutex);
+                
+                if (!request) {
+                    LOG_ERROR("Parse failed for data: %.100s", node->data);
+                    send(client_sock, RESPONSE_500, strlen(RESPONSE_500), 0);
+                    free(node->data);
+                    free(node);
+                    continue;
+                }
+                
+                // 处理请求
+                if (strcmp(request->http_method, "GET") == 0 ||
+                    strcmp(request->http_method, "HEAD") == 0)
                 {
-                    free(request->headers);
+                    handle_get_head_request(client_sock, request);
+                }
+                else if (strcmp(request->http_method, "POST") == 0)
+                {
+                    handle_post_request(client_sock, node->data, node->size);
+                }
+                else
+                {
+                    LOG_WARN("Unsupported method %s from %s:%d",
+                             request->http_method,
+                             client_ip,
+                             ntohs(client_addr.sin_port));
+                    handle_unsupported_method(client_sock);
                 }
                 free(request);
             }
-            else
-            {
-                LOG_ERROR("Failed to parse request %d", request_count);
-                send(client_sock, RESPONSE_400, strlen(RESPONSE_400), 0);
-            }
+        }
 
-            // 移动到下一个请求
-            request_start = next_request + 4;
-
-            // 处理剩余的不完整请求数据
-            if (strstr(request_start, "\r\n\r\n") == NULL)
+        // 处理剩余的不完整请求数据
+        size_t remaining = (buf + readret) - current;
+        if (remaining > 0)
+        {
+            char *new_partial = malloc(remaining + 1);
+            if (!new_partial)
             {
-                size_t remaining = total_received - (request_start - pipeline_buf);
-                if (remaining > 0)
-                {
-                    LOG_INFO("Moving %zu bytes of incomplete request to buffer start",
-                             remaining);
-                    memmove(pipeline_buf, request_start, remaining);
-                }
-                total_received = remaining;
+                LOG_ERROR("Failed to allocate memory for partial request from %s:%d",
+                          client_ip, ntohs(client_addr.sin_port));
                 break;
             }
+            memcpy(new_partial, current, remaining);
+            new_partial[remaining] = '\0';
+            free(partial_buf);
+            partial_buf = new_partial;
+            partial_len = remaining;
+            LOG_DEBUG("Stored %zu bytes of partial request from %s:%d",
+                      remaining, client_ip, ntohs(client_addr.sin_port));
         }
-
-        // 检查是否需要关闭连接
-        if (!strstr(pipeline_buf, "Connection: keep-alive"))
+        else
         {
-            LOG_INFO("Connection: close requested, ending pipeline");
-            break;
+            free(partial_buf);
+            partial_buf = NULL;
+            partial_len = 0;
         }
     }
 
-    if (readret == -1)
+    // 清理资源
+    free(partial_buf);
+    while (dequeueRequest(&queue))
     {
-        LOG_ERROR("Error reading from client socket: %s", strerror(errno));
-    }
-
-    LOG_INFO("Closing connection with client %s:%d",
-             inet_ntoa(client_addr.sin_addr),
-             ntohs(client_addr.sin_port));
-
-    close_socket(client_sock);
+    } // 清空队列
+    pthread_mutex_destroy(&queue.mutex);
+    close(client_sock);
+    LOG_INFO("Closed connection from %s:%d", client_ip, ntohs(client_addr.sin_port));
 }
 
 void handle_get_head_request(int client_sock, Request *request)
@@ -441,14 +562,21 @@ void handle_get_head_request(int client_sock, Request *request)
              "\r\n",
              content_type,
              path_stat.st_size);
-
-    send(client_sock, response_header, strlen(response_header), 0);
+    // 如果是 HEAD 请求，只发送响应头
+    if (strcmp(request->http_method, "HEAD") == 0   )
+    {
+        send(client_sock, response_header, strlen(response_header), 0);
+        return;
+    }
 
     // 如果是 GET 请求，发送文件内容
     if (strcmp(request->http_method, "GET") == 0)
     {
         char file_buf[BUF_SIZE];
         size_t file_read;
+        file_read = fread(file_buf, 1, BUF_SIZE - strlen(response_header) - 1, file);
+        strcat(response_header, file_buf);   
+        send(client_sock, response_header, strlen(response_header), 0);
         while ((file_read = fread(file_buf, 1, BUF_SIZE, file)) > 0)
         {
             send(client_sock, file_buf, file_read, 0);
@@ -535,7 +663,7 @@ void handle_post_request(int client_sock, char *buf, ssize_t readret)
              "Content-Length: %ld\r\n"
              "Connection: close\r\n"
              "\r\n",
-             strlen(post_data) + 19, post_data);
+             strlen(post_data) + 19);
 
     send(client_sock, response, strlen(response), 0);
     send(client_sock, buf, readret, 0);

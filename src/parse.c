@@ -55,15 +55,30 @@ Request * parse(char *buffer, int size) {
     // Valid End State
     if (state == STATE_CRLFCRLF) {
         Request *request = (Request *) malloc(sizeof(Request));
+                if (!request) {
+            return NULL;
+        }
+        // 初始化所有字段为 NULL
+        memset(request, 0, sizeof(Request));
         request->header_count = 0;
         request->header_capacity = default_header_capacity;
         request->headers = (Request_header *) malloc(sizeof(Request_header) * request->header_capacity);
-
+        if (!request->headers) {
+            free(request);
+            return NULL;
+        }
         // 设置解析选项
         set_parsing_options(buf, i, request);
 
         // 解析 HTTP 方法行
         if (yyparse() == SUCCESS) {
+            // 验证必需的字段
+            if (!request->http_method || !request->http_uri || !request->http_version) {
+                free(request->headers);
+                free(request);
+                return NULL;
+            }
+
             // 检查是否为已实现的方法
             if (strcmp(request->http_method, "GET") == 0 || 
                 strcmp(request->http_method, "HEAD") == 0 || 
@@ -80,7 +95,6 @@ Request * parse(char *buffer, int size) {
         }
     }
 
-    // 请求格式错误
     printf("Parsing Failed\n");
     return NULL;
 }

@@ -2,3 +2,8 @@ docs/
 static_site/uploads/
 *.tar
 *.log
+*.html
+*.cmd
+week3/
+week4/
+cheat/

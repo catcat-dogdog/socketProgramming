@@ -5,7 +5,7 @@ SRC := $(wildcard $(SRC_DIR)/*.c)
 # all objects
 OBJ := $(OBJ_DIR)/y.tab.o $(OBJ_DIR)/lex.yy.o $(OBJ_DIR)/parse.o $(OBJ_DIR)/example.o $(OBJ_DIR)/logger.o
 # all binaries
-BIN := example liso_server echo_client
+BIN := example liso_server echo_client read_client
 # C compiler
 CC  := gcc
 # C PreProcessor Flag
@@ -16,7 +16,7 @@ CFLAGS   := -g -Wall
 LDFLAGS := -pthread
 
 default: all
-all : example liso_server echo_client
+all : example liso_server echo_client read_client
 
 example: $(OBJ)
 	$(CC) $^ -o $@ $(LDFLAGS)
@@ -36,6 +36,9 @@ liso_server: $(OBJ_DIR)/y.tab.o $(OBJ_DIR)/lex.yy.o $(OBJ_DIR)/parse.o $(OBJ_DIR
 	$(CC) -Werror $^ -o $@ $(LDFLAGS)
 
 echo_client: $(OBJ_DIR)/echo_client.o $(OBJ_DIR)/logger.o
+	$(CC) -Werror $^ -o $@ $(LDFLAGS)
+
+read_client: $(OBJ_DIR)/read_client.o
 	$(CC) -Werror $^ -o $@ $(LDFLAGS)
 
 $(OBJ_DIR):

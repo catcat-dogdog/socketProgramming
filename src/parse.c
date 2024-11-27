@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #define default_header_capacity 16
+extern void yyrestart(FILE *input_file);
 extern FILE *yyin;
 
 /**

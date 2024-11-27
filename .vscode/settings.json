@@ -1,5 +1,8 @@
 {
     "files.associations": {
-        "parse.h": "c"
+        "parse.h": "c",
+        "request_queue": "cpp",
+        "errno.h": "c",
+        "string.h": "c"
     }
 }

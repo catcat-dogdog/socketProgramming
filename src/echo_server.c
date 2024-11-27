@@ -404,7 +404,7 @@ void handle_client(int client_sock, struct sockaddr_in client_addr)
         }
 
         buf[readret] = '\0';
-        LOG_DEBUG("Received %zd bytes from %s:%d", readret, client_ip, ntohs(client_addr.sin_port));
+        // LOG_DEBUG("Received %zd bytes from %s:%d", readret, client_ip, ntohs(client_addr.sin_port));
         char *current = buf;
 
         // 处理之前的不完整请求
@@ -437,8 +437,8 @@ void handle_client(int client_sock, struct sockaddr_in client_addr)
                 break;
             }
 
-            LOG_DEBUG("Enqueued request from %s:%d, queue size: %d",
-                      client_ip, ntohs(client_addr.sin_port), queue.count);
+            // LOG_DEBUG("Enqueued request from %s:%d, queue size: %d",
+            //           client_ip, ntohs(client_addr.sin_port), queue.count);
 
             current = request_end + 4;
 
@@ -452,7 +452,8 @@ void handle_client(int client_sock, struct sockaddr_in client_addr)
                 pthread_mutex_unlock(&parser_mutex);
                 
                 if (!request) {
-                    LOG_ERROR("Parse failed for data: %.100s", node->data);
+                    LOG_ERROR("Parse failed");
+                    LOG_INFO("Sending 400 Bad Request response");
                     send(client_sock, RESPONSE_400, strlen(RESPONSE_400), 0);
                     free(node->data);
                     free(node);
@@ -493,8 +494,8 @@ void handle_client(int client_sock, struct sockaddr_in client_addr)
             free(partial_buf);
             partial_buf = new_partial;
             partial_len = remaining;
-            LOG_DEBUG("Stored %zu bytes of partial request from %s:%d",
-                      remaining, client_ip, ntohs(client_addr.sin_port));
+            // LOG_DEBUG("Stored %zu bytes of partial request from %s:%d",
+            //           remaining, client_ip, ntohs(client_addr.sin_port));
         }
         else
         {

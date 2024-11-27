@@ -25,16 +25,14 @@
 #include "logger.h"
 #include <sys/stat.h>
 #include <time.h>
-#include <sys/epoll.h>
-#include <pthread.h>
 #include <stdbool.h>
 
 #define ECHO_PORT 9999
 #define BUF_SIZE 4096
 #define MAX_REQUESTS_IN_PIPELINE 10
-#define MAX_EVENTS 1024
-#define MAX_THREADS 8
-#define THREAD_QUEUE_SIZE 1024
+#define MAX_CLIENTS 1024           // 最大客户端连接数
+#define TIMEOUT_SECS 5             // select超时时间(秒)
+#define MAX_CONTENT_LENGTH 1048576 // 1MB 最大 POST 数据大小
 
 // 响应状态码定义
 #define RESPONSE_200 "HTTP/1.1 200 OK\r\n"
@@ -43,49 +41,6 @@
 #define RESPONSE_500 "HTTP/1.1 500 Internal Server Error\r\n\r\n"
 #define RESPONSE_501 "HTTP/1.1 501 Not Implemented\r\n\r\n"
 #define RESPONSE_505 "HTTP/1.1 505 HTTP Version Not Supported\r\n\r\n"
-
-// 添加在文件开头的全局变量部分
-struct mime_type
-{
-    const char *extension;
-    const char *type;
-};
-
-static const struct mime_type mime_types[] = {
-    {".html", "text/html"},
-    {".css", "text/css"},
-    {".js", "application/javascript"},
-    {".jpg", "image/jpeg"},
-    {".jpeg", "image/jpeg"},
-    {".png", "image/png"},
-    {".gif", "image/gif"},
-    {".ico", "image/x-icon"},
-    {NULL, NULL}};
-
-// 添加在文件开头的常量定义部分
-#define MAX_CONTENT_LENGTH 1048576 // 1MB 最大 POST 数据大小
-
-// 新增获取 MIME 类型的辅助函数
-const char *get_mime_type(const char *filename)
-{
-    const char *dot = strrchr(filename, '.');
-    if (!dot)
-        return "application/octet-stream";
-
-    for (const struct mime_type *m = mime_types; m->extension; m++)
-    {
-        if (strcasecmp(dot, m->extension) == 0)
-        {
-            return m->type;
-        }
-    }
-    return "application/octet-stream";
-}
-
-// 新增函数声明
-void handle_get_head_request(int client_sock, Request *request);
-void handle_post_request(int client_sock, char *buf, ssize_t readret);
-void handle_unsupported_method(int client_sock);
 
 int close_socket(int sock)
 {
@@ -107,15 +62,24 @@ struct RequestQueue
         struct RequestNode *next;
     } *head, *tail;
     int count;
-    pthread_mutex_t mutex;
 };
+
+// 修改客户端结构体，添加请求队列
+typedef struct
+{
+    int sockfd;
+    struct sockaddr_in addr;
+    char buffer[BUF_SIZE];
+    size_t buf_len;
+    time_t last_active;
+    struct RequestQueue queue; // 添加请求队列
+} client_t;
 
 // 初始化请求队列
 void initQueue(struct RequestQueue *queue)
 {
     queue->head = queue->tail = NULL;
     queue->count = 0;
-    pthread_mutex_init(&queue->mutex, NULL);
 }
 
 // 添加请求到队列
@@ -137,7 +101,6 @@ bool enqueueRequest(struct RequestQueue *queue, const char *data, size_t size)
     node->size = size;
     node->next = NULL;
 
-    pthread_mutex_lock(&queue->mutex);
     if (queue->tail)
     {
         queue->tail->next = node;
@@ -148,7 +111,6 @@ bool enqueueRequest(struct RequestQueue *queue, const char *data, size_t size)
     }
     queue->tail = node;
     queue->count++;
-    pthread_mutex_unlock(&queue->mutex);
 
     return true;
 }
@@ -156,12 +118,8 @@ bool enqueueRequest(struct RequestQueue *queue, const char *data, size_t size)
 // 从队列中获取请求
 struct RequestNode *dequeueRequest(struct RequestQueue *queue)
 {
-    pthread_mutex_lock(&queue->mutex);
     if (!queue->head)
-    {
-        pthread_mutex_unlock(&queue->mutex);
         return NULL;
-    }
 
     struct RequestNode *node = queue->head;
     queue->head = node->next;
@@ -170,45 +128,20 @@ struct RequestNode *dequeueRequest(struct RequestQueue *queue)
         queue->tail = NULL;
     }
     queue->count--;
-    pthread_mutex_unlock(&queue->mutex);
-
     return node;
 }
 
-// 线程池结构
-typedef struct
-{
-    pthread_t *threads;
-    int thread_count;
-
-    // 任务队列
-    struct
-    {
-        int client_sock;
-        struct sockaddr_in client_addr;
-    } *tasks;
-
-    int task_capacity;
-    int task_size;
-    int task_front;
-    int task_rear;
-
-    pthread_mutex_t queue_mutex;
-    pthread_cond_t queue_not_empty;
-    pthread_cond_t queue_not_full;
-    bool shutdown;
-} ThreadPool;
-
-// 声明线程池函数
-ThreadPool *thread_pool_create(int thread_count);
-void thread_pool_destroy(ThreadPool *pool);
-void thread_pool_add_task(ThreadPool *pool, int client_sock, struct sockaddr_in client_addr);
-void *worker_thread(void *arg);
+// 客户端请求处理
+void handle_client(client_t *client);
+void handle_get_head_request(int client_sock, Request *request);
+void handle_post_request(int client_sock, char *buf, ssize_t readret);
+void handle_unsupported_method(int client_sock);
 
 int main(int argc, char *argv[])
 {
-    int sock;
-    struct sockaddr_in addr;
+    int server_sock;
+    struct sockaddr_in server_addr;
+    client_t clients[MAX_CLIENTS] = {0}; // 初始化客户端数组
 
     fprintf(stdout, "----- Echo Server -----\n");
 
@@ -222,7 +155,7 @@ int main(int argc, char *argv[])
     LOG_INFO("Echo Server starting...");
 
     // 创建一个socket
-    if ((sock = socket(PF_INET, SOCK_STREAM, 0)) == -1)
+    if ((server_sock = socket(PF_INET, SOCK_STREAM, 0)) == -1)
     {
         LOG_ERROR("Failed creating socket");
         log_close();
@@ -231,294 +164,191 @@ int main(int argc, char *argv[])
 
     // 添加 socket 重用选项
     int optval = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1)
+    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1)
     {
         LOG_ERROR("Failed to set socket options");
-        close_socket(sock);
+        close_socket(server_sock);
         log_close();
         return EXIT_FAILURE;
     }
 
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(ECHO_PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(ECHO_PORT);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
 
     /* servers bind sockets to ports---notify the OS they accept connections */
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)))
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)))
     {
         LOG_ERROR("Failed binding socket: %s", strerror(errno));
-        close_socket(sock); // 确保在错误时关闭 socket
+        close_socket(server_sock); // 确保在错误时关闭 socket
         log_close();
         return EXIT_FAILURE;
     }
 
-    if (listen(sock, 5))
+    if (listen(server_sock, 5))
     {
         LOG_ERROR("Error listening on socket: %s", strerror(errno));
-        close_socket(sock);
+        close_socket(server_sock);
         log_close();
         return EXIT_FAILURE;
     }
 
-    // 创建 epoll 实例
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd == -1)
-    {
-        LOG_ERROR("Failed to create epoll instance");
-        close_socket(sock);
-        log_close();
-        return EXIT_FAILURE;
-    }
+    // 设置非阻塞
+    int flags = fcntl(server_sock, F_GETFL, 0);
+    fcntl(server_sock, F_SETFL, flags | O_NONBLOCK);
 
-    // 创建线程池
-    ThreadPool *thread_pool = thread_pool_create(MAX_THREADS);
-    if (!thread_pool)
-    {
-        LOG_ERROR("Failed to create thread pool");
-        close_socket(sock);
-        log_close();
-        return EXIT_FAILURE;
-    }
-
-    // 添加监听 socket 到 epoll
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = sock;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) == -1)
-    {
-        LOG_ERROR("Failed to add listening socket to epoll");
-        close_socket(sock);
-        log_close();
-        return EXIT_FAILURE;
-    }
-
-    // 事件循环
-    struct epoll_event events[MAX_EVENTS];
     while (1)
     {
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
-        if (nfds == -1)
+        fd_set read_fds;
+        struct timeval tv;
+        int max_fd = server_sock;
+
+        FD_ZERO(&read_fds);
+        FD_SET(server_sock, &read_fds);
+
+        // 添加所有活跃的客户端到fd_set
+        for (int i = 0; i < MAX_CLIENTS; i++)
         {
-            LOG_ERROR("epoll_wait error");
+            if (clients[i].sockfd > 0)
+            {
+                FD_SET(clients[i].sockfd, &read_fds);
+                if (clients[i].sockfd > max_fd)
+                {
+                    max_fd = clients[i].sockfd;
+                }
+            }
+        }
+
+        // 设置select超时
+        tv.tv_sec = TIMEOUT_SECS;
+        tv.tv_usec = 0;
+
+        int activity = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+
+        if (activity < 0)
+        {
+            LOG_ERROR("Select error: %s", strerror(errno));
             continue;
         }
 
-        for (int i = 0; i < nfds; i++)
+        // 处理新连接
+        if (FD_ISSET(server_sock, &read_fds))
         {
-            if (events[i].data.fd == sock)
+            struct sockaddr_in client_addr;
+            socklen_t addr_len = sizeof(client_addr);
+            int client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_len);
+
+            if (client_sock < 0)
             {
-                // 处理新连接
-                struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
-                int client_sock = accept(sock, (struct sockaddr *)&client_addr, &client_len);
+                LOG_ERROR("Accept failed: %s", strerror(errno));
+                continue;
+            }
 
-                if (client_sock == -1)
+            // 设置新socket为非阻塞
+            flags = fcntl(client_sock, F_GETFL, 0);
+            fcntl(client_sock, F_SETFL, flags | O_NONBLOCK);
+
+            // 获取客户端IP地址
+            char client_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+
+            // 查找空闲的客户端槽位
+            int i;
+            for (i = 0; i < MAX_CLIENTS; i++)
+            {
+                if (clients[i].sockfd == 0)
                 {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    {
-                        // 非阻塞模式下没有连接可接受
-                        continue;
-                    }
-                    LOG_ERROR("Accept failed: %s", strerror(errno));
-                    continue;  // 继续循环而不是退出
-                }
+                    clients[i].sockfd = client_sock;
+                    clients[i].addr = client_addr;
+                    clients[i].buf_len = 0;
+                    clients[i].last_active = time(NULL);
+                    initQueue(&clients[i].queue); // 初始化请求队列
 
-                // 设置客户端socket为非阻塞模式
-                int flags = fcntl(client_sock, F_GETFL, 0);
-                if (flags != -1)
-                {
-                    fcntl(client_sock, F_SETFL, flags | O_NONBLOCK);
+                    LOG_INFO("New client connected - IP: %s, Port: %d, Socket: %d, Slot: %d",
+                             client_ip,
+                             ntohs(client_addr.sin_port),
+                             client_sock,
+                             i);
+                    break;
                 }
+            }
 
-                // 将新客户端添加到线程池
-                thread_pool_add_task(thread_pool, client_sock, client_addr);
+            if (i == MAX_CLIENTS)
+            {
+                LOG_ERROR("Connection rejected - Too many connections (Max: %d) from IP: %s, Port: %d",
+                          MAX_CLIENTS,
+                          client_ip,
+                          ntohs(client_addr.sin_port));
+                close(client_sock);
+            }
+        }
+
+        // 处理客户端数据
+        for (int i = 0; i < MAX_CLIENTS; i++)
+        {
+            if (clients[i].sockfd > 0 && FD_ISSET(clients[i].sockfd, &read_fds))
+            {
+                handle_client(&clients[i]);
+            }
+        }
+
+        // 检查超时连接
+        time_t current_time = time(NULL);
+        for (int i = 0; i < MAX_CLIENTS; i++)
+        {
+            if (clients[i].sockfd > 0 &&
+                (current_time - clients[i].last_active) > TIMEOUT_SECS)
+            {
+                close(clients[i].sockfd);
+                clients[i].sockfd = 0;
             }
         }
     }
 
     // 清理资源
-    thread_pool_destroy(thread_pool);
-    close(epoll_fd);
-    close_socket(sock);
+    close(server_sock);
     log_close();
     return EXIT_SUCCESS;
 }
 
-// 添加语法解析锁
-static pthread_mutex_t parser_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// 处理客户端请求
-void handle_client(int client_sock, struct sockaddr_in client_addr)
+struct mime_type
 {
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
-    LOG_INFO("New client connection from %s:%d", client_ip, ntohs(client_addr.sin_port));
+    const char *extension;
+    const char *type;
+};
 
-    char buf[BUF_SIZE];
-    struct RequestQueue queue;
-    initQueue(&queue);
-    size_t partial_len = 0;
-    char *partial_buf = NULL;
+static const struct mime_type mime_types[] = {
+    {".html", "text/html"},
+    {".css", "text/css"},
+    {".js", "application/javascript"},
+    {".jpg", "image/jpeg"},
+    {".jpeg", "image/jpeg"},
+    {".png", "image/png"},
+    {".gif", "image/gif"},
+    {".ico", "image/x-icon"},
+    {NULL, NULL}};
 
-    // 设置超时时间
-    struct timeval tv;
-    tv.tv_sec = 5;  // 5秒超时
-    tv.tv_usec = 0;
-    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+// 新增获取 MIME 类型的辅助函数
+const char *get_mime_type(const char *filename)
+{
+    const char *dot = strrchr(filename, '.');
+    if (!dot)
+        return "application/octet-stream";
 
-    while (1) {
-        ssize_t readret = recv(client_sock, buf, BUF_SIZE - 1, 0);
-        if (readret < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // 使用select来等待数据
-                fd_set readfds;
-                FD_ZERO(&readfds);
-                FD_SET(client_sock, &readfds);
-                
-                struct timeval timeout;
-                timeout.tv_sec = 1;  // 1秒超时
-                timeout.tv_usec = 0;
-                
-                int select_result = select(client_sock + 1, &readfds, NULL, NULL, &timeout);
-                if (select_result > 0) {
-                    continue;  // 有数据可读，继续循环
-                } else if (select_result == 0) {
-                    // 超时，但继续等待
-                    continue;
-                } else {
-                    // select错误
-                    LOG_ERROR("Select error for client %s:%d: %s",
-                             client_ip, ntohs(client_addr.sin_port), strerror(errno));
-                    break;
-                }
-            }
-            
-            LOG_ERROR("Failed to read from client %s:%d: %s",
-                      client_ip, ntohs(client_addr.sin_port), strerror(errno));
-            break;
-        }
-        if (readret == 0)
+    for (const struct mime_type *m = mime_types; m->extension; m++)
+    {
+        if (strcasecmp(dot, m->extension) == 0)
         {
-            LOG_INFO("Client %s:%d disconnected", client_ip, ntohs(client_addr.sin_port));
-            break;
-        }
-
-        buf[readret] = '\0';
-        // LOG_DEBUG("Received %zd bytes from %s:%d", readret, client_ip, ntohs(client_addr.sin_port));
-        char *current = buf;
-
-        // 处理之前的不完整请求
-        if (partial_buf)
-        {
-            char *new_buf = realloc(partial_buf, partial_len + readret + 1);
-            if (!new_buf)
-            {
-                free(partial_buf);
-                break;
-            }
-            partial_buf = new_buf;
-            memcpy(partial_buf + partial_len, buf, readret);
-            partial_len += readret;
-            partial_buf[partial_len] = '\0';
-            current = partial_buf;
-        }
-
-        // 解析请求
-        char *request_end;
-        while ((request_end = strstr(current, "\r\n\r\n")))
-        {
-            size_t request_len = request_end - current + 4;
-
-            // 将完整请求加入队列
-            if (!enqueueRequest(&queue, current, request_len))
-            {
-                LOG_ERROR("Failed to enqueue request from %s:%d: out of memory",
-                          client_ip, ntohs(client_addr.sin_port));
-                break;
-            }
-
-            // LOG_DEBUG("Enqueued request from %s:%d, queue size: %d",
-            //           client_ip, ntohs(client_addr.sin_port), queue.count);
-
-            current = request_end + 4;
-
-            // 处理队列中的请求
-            struct RequestNode *node;
-            while ((node = dequeueRequest(&queue)))
-            {
-                // 在解析前加锁
-                pthread_mutex_lock(&parser_mutex);
-                Request *request = parse(node->data, node->size);
-                pthread_mutex_unlock(&parser_mutex);
-                
-                if (!request) {
-                    LOG_ERROR("Parse failed");
-                    LOG_INFO("Sending 400 Bad Request response");
-                    send(client_sock, RESPONSE_400, strlen(RESPONSE_400), 0);
-                    free(node->data);
-                    free(node);
-                    continue;
-                }
-                
-                // 处理请求
-                if (strcmp(request->http_method, "GET") == 0 ||
-                    strcmp(request->http_method, "HEAD") == 0)
-                {
-                    handle_get_head_request(client_sock, request);
-                }
-                else if (strcmp(request->http_method, "POST") == 0)
-                {
-                    handle_post_request(client_sock, node->data, node->size);
-                }
-                else
-                {
-                    handle_unsupported_method(client_sock);
-                }
-                free(request);
-            }
-        }
-
-        // 处理剩余的不完整请求数据
-        size_t remaining = (buf + readret) - current;
-        if (remaining > 0)
-        {
-            char *new_partial = malloc(remaining + 1);
-            if (!new_partial)
-            {
-                LOG_ERROR("Failed to allocate memory for partial request from %s:%d",
-                          client_ip, ntohs(client_addr.sin_port));
-                break;
-            }
-            memcpy(new_partial, current, remaining);
-            new_partial[remaining] = '\0';
-            free(partial_buf);
-            partial_buf = new_partial;
-            partial_len = remaining;
-            // LOG_DEBUG("Stored %zu bytes of partial request from %s:%d",
-            //           remaining, client_ip, ntohs(client_addr.sin_port));
-        }
-        else
-        {
-            free(partial_buf);
-            partial_buf = NULL;
-            partial_len = 0;
+            return m->type;
         }
     }
-
-    // 清理资源
-    free(partial_buf);
-    while (dequeueRequest(&queue))
-    {
-    } // 清空队列
-    pthread_mutex_destroy(&queue.mutex);
-    close(client_sock);
-    LOG_INFO("Closed connection from %s:%d", client_ip, ntohs(client_addr.sin_port));
+    return "application/octet-stream";
 }
 
 void handle_get_head_request(int client_sock, Request *request)
 {
     LOG_INFO("Processing %s request for URI: %s", request->http_method, request->http_uri);
-    
+
     char file_path[BUF_SIZE] = "static_site";
 
     // 处理根路径请求
@@ -577,12 +407,12 @@ void handle_get_head_request(int client_sock, Request *request)
         char file_buf[BUF_SIZE];
         size_t file_read;
         size_t total_sent = 0;
-        
+
         file_read = fread(file_buf, 1, BUF_SIZE - strlen(response_header) - 1, file);
-        strcat(response_header, file_buf);   
+        strcat(response_header, file_buf);
         send(client_sock, response_header, strlen(response_header), 0);
         total_sent += file_read;
-        
+
         while ((file_read = fread(file_buf, 1, BUF_SIZE, file)) > 0)
         {
             send(client_sock, file_buf, file_read, 0);
@@ -690,126 +520,112 @@ void handle_unsupported_method(int client_sock)
     LOG_INFO("Sent 501 Not Implemented response");
 }
 
-ThreadPool *thread_pool_create(int thread_count)
+// 处理客户端
+void handle_client(client_t *client)
 {
-    ThreadPool *pool = (ThreadPool *)malloc(sizeof(ThreadPool));
-    if (!pool)
-        return NULL;
+    ssize_t bytes_read = recv(client->sockfd,
+                              client->buffer + client->buf_len,
+                              BUF_SIZE - client->buf_len - 1,
+                              0);
 
-    pool->thread_count = thread_count;
-    pool->threads = (pthread_t *)malloc(sizeof(pthread_t) * thread_count);
-    pool->tasks = malloc(sizeof(*pool->tasks) * THREAD_QUEUE_SIZE);
-    pool->task_capacity = THREAD_QUEUE_SIZE;
-    pool->task_size = 0;
-    pool->task_front = 0;
-    pool->task_rear = 0;
-    pool->shutdown = false;
-
-    pthread_mutex_init(&pool->queue_mutex, NULL);
-    pthread_cond_init(&pool->queue_not_empty, NULL);
-    pthread_cond_init(&pool->queue_not_full, NULL);
-
-    // 创建工作线程
-    for (int i = 0; i < thread_count; i++)
+    if (bytes_read <= 0)
     {
-        pthread_create(&pool->threads[i], NULL, worker_thread, pool);
-    }
-
-    return pool;
-}
-
-void *worker_thread(void *arg)
-{
-    ThreadPool *pool = (ThreadPool *)arg;
-    pthread_t tid = pthread_self();
-    // LOG_INFO("Worker thread %lu started", (unsigned long)tid);
-
-    while (1)
-    {
-        pthread_mutex_lock(&pool->queue_mutex);
-
-        while (pool->task_size == 0 && !pool->shutdown)
-        {
-            // LOG_DEBUG("Thread %lu waiting for task", (unsigned long)tid);
-            pthread_cond_wait(&pool->queue_not_empty, &pool->queue_mutex);
-        }
-
-        if (pool->shutdown)
-        {
-            // LOG_INFO("Thread %lu shutting down", (unsigned long)tid);
-            pthread_mutex_unlock(&pool->queue_mutex);
-            pthread_exit(NULL);
-        }
-
-        // 获取任务
-        int client_sock = pool->tasks[pool->task_front].client_sock;
-        struct sockaddr_in client_addr = pool->tasks[pool->task_front].client_addr;
-        pool->task_front = (pool->task_front + 1) % pool->task_capacity;
-        pool->task_size--;
-
-        // LOG_INFO("Thread %lu processing new client connection", (unsigned long)tid);
-
-        pthread_mutex_unlock(&pool->queue_mutex);
-        pthread_cond_signal(&pool->queue_not_full);
-
-        // 处理客户端请求
-        handle_client(client_sock, client_addr);
-    }
-
-    return NULL;
-}
-
-void thread_pool_add_task(ThreadPool *pool, int client_sock, struct sockaddr_in client_addr)
-{
-    pthread_mutex_lock(&pool->queue_mutex);
-
-    // 等待队列有空间
-    while (pool->task_size == pool->task_capacity && !pool->shutdown)
-    {
-        pthread_cond_wait(&pool->queue_not_full, &pool->queue_mutex);
-    }
-
-    if (pool->shutdown)
-    {
-        pthread_mutex_unlock(&pool->queue_mutex);
+        // 连接关闭或错误
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(client->addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+        LOG_INFO("Client %s:%d disconnected", client_ip, ntohs(client->addr.sin_port));
+        close(client->sockfd);
+        client->sockfd = 0;
         return;
     }
 
-    // 添加任务到队列
-    pool->tasks[pool->task_rear].client_sock = client_sock;
-    pool->tasks[pool->task_rear].client_addr = client_addr;
-    pool->task_rear = (pool->task_rear + 1) % pool->task_capacity;
-    pool->task_size++;
+    client->buf_len += bytes_read;
+    client->buffer[client->buf_len] = '\0';
+    client->last_active = time(NULL);
 
-    pthread_mutex_unlock(&pool->queue_mutex);
-    pthread_cond_signal(&pool->queue_not_empty);
-}
+    // 处理pipeline请求
+    char *current_pos = client->buffer;
+    char *request_end;
 
-// 同时也应该实现 thread_pool_destroy 函数
-void thread_pool_destroy(ThreadPool *pool)
-{
-    if (pool == NULL)
-        return;
-
-    pthread_mutex_lock(&pool->queue_mutex);
-    pool->shutdown = true;
-    pthread_mutex_unlock(&pool->queue_mutex);
-
-    // 唤醒所有等待的线程
-    pthread_cond_broadcast(&pool->queue_not_empty);
-    pthread_cond_broadcast(&pool->queue_not_full);
-
-    // 等待所有线程结束
-    for (int i = 0; i < pool->thread_count; i++)
+    while ((request_end = strstr(current_pos, "\r\n\r\n")))
     {
-        pthread_join(pool->threads[i], NULL);
+        size_t request_size = request_end - current_pos + 4;
+
+        // 将完整的请求加入队列
+        if (!enqueueRequest(&client->queue, current_pos, request_size))
+        {
+            LOG_ERROR("Failed to enqueue request");
+            send(client->sockfd, RESPONSE_500, strlen(RESPONSE_500), 0);
+            return;
+        }
+
+        current_pos = request_end + 4;
+
+        // 处理队列中的请求（最多处理MAX_REQUESTS_IN_PIPELINE个）
+        while (client->queue.count > 0 &&
+               client->queue.count <= MAX_REQUESTS_IN_PIPELINE)
+        {
+            struct RequestNode *node = dequeueRequest(&client->queue);
+            if (!node)
+                break;
+
+            // 解析并处理请求
+            Request *request = parse(node->data, node->size);
+            if (request)
+            {
+                if (strcmp(request->http_method, "GET") == 0 ||
+                    strcmp(request->http_method, "HEAD") == 0)
+                {
+                    handle_get_head_request(client->sockfd, request);
+                }
+                else if (strcmp(request->http_method, "POST") == 0)
+                {
+                    handle_post_request(client->sockfd, node->data, node->size);
+                }
+                else
+                {
+                    handle_unsupported_method(client->sockfd);
+                }
+                free(request);
+            }
+            else
+            {
+                send(client->sockfd, RESPONSE_400, strlen(RESPONSE_400), 0);
+            }
+
+            // 清理节点
+            free(node->data);
+            free(node);
+        }
+
+        // 如果队列中的请求数超过限制，返回错误
+        if (client->queue.count > MAX_REQUESTS_IN_PIPELINE)
+        {
+            LOG_ERROR("Too many requests in pipeline");
+            send(client->sockfd, RESPONSE_500, strlen(RESPONSE_500), 0);
+            return;
+        }
     }
 
-    // 释放资源
-    free(pool->threads);
-    free(pool->tasks);
-    pthread_mutex_destroy(&pool->queue_mutex);
-    pthread_cond_destroy(&pool->queue_not_empty);
-    pthread_cond_destroy(&pool->queue_not_full);
-    free(pool);
+    // 移动未处理的数据到缓冲区开始
+    size_t remaining = client->buf_len - (current_pos - client->buffer);
+    if (remaining > 0 && current_pos != client->buffer)
+    {
+        memmove(client->buffer, current_pos, remaining);
+        client->buf_len = remaining;
+    }
+    else if (current_pos == client->buffer)
+    {
+        // 如果没有找到完整请求，检查缓冲区是否已满
+        if (client->buf_len >= BUF_SIZE - 1)
+        {
+            LOG_ERROR("Request too large");
+            send(client->sockfd, RESPONSE_400, strlen(RESPONSE_400), 0);
+            client->buf_len = 0;
+        }
+    }
+    else
+    {
+        client->buf_len = 0;
+    }
 }

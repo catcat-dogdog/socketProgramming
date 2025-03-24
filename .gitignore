@@ -1,8 +1,9 @@
 docs/
 static_site/uploads/
+obj/
+*.o
 *.tar
 *.log
-*.html
 *.cmd
 *.py
 week3/

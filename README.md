@@ -27,4 +27,4 @@ This repository contains the starter code for ***CMU 15-441/641 Networking and t
 6. To test your server using a web browser, you need to configure port mapping for the docker container. Simply add the argument `-p 8888:15441` to the `docker run` command to establish a mapping from `127.0.0.1:15441` in the container to `127.0.0.1:8888` on your local machine. Then you can test your server by using a web browser (e.g., Chrome) on your local machine to navigate to the URL `127.0.0.1:8888`.
 
 ## 3. Structure
-![web server structure](docs/images/robot.png)
+![web server structure](docs/images/structure.png)

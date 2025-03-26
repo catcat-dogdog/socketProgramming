@@ -23,15 +23,19 @@ This project is based on **CMU 15-441/641 Networking and the Internet Project 1:
 ## Usage
 1. Start the server:
    ```bash
+   docker exec -it <container_name> /bin/bash
+   cd /home/socketProgramming/
    ./server.sh
    ```
-2. Open another terminal, navigate to the project directory:
+2. Open another terminal and run a test HTTP request using the echo client:
    ```bash
+   docker exec -it <container_name> /bin/bash
    cd /home/socketProgramming/
    ```
-3. Run a test HTTP request using the echo client:
+3. Or use the example in `samples`:
    ```bash
-   ./echo_client <a_http_request>
+   ./echo_client samples/request_get
+   ./echo_client samples/request_pipeline
    ```
 4. You can also test the server by opening a browser and visiting:
    ```

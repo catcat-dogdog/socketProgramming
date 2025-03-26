@@ -14,9 +14,10 @@ This project is based on **CMU 15-441/641 Networking and the Internet Project 1:
    ```bash
    docker run -it -p 9999:9999 -v `pwd`:/home/socketProgramming/ --name <container_name> socketProgramming /bin/bash
    ```
-3. Clone this repository inside the container:
+3. Clone this repository and build:
    ```bash
    git clone https://github.com/catcat-dogdog/socketProgramming.git
+   make
    ```
 
 ## Usage

@@ -31,6 +31,7 @@ This project is based on **CMU 15-441/641 Networking and the Internet Project 1:
    ```bash
    docker exec -it <container_name> /bin/bash
    cd /home/socketProgramming/
+   ./echo_client <http_request>
    ```
 3. Or use the example in `samples`:
    ```bash
